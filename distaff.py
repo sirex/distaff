@@ -1,5 +1,14 @@
+import copy
 import datetime
 import itertools
+import logging
+
+
+logger = logging.getLogger(__name__)
+
+
+def dtype(type, **kwargs):
+    return dict(type=type, **kwargs)
 
 
 class Missing:
@@ -11,36 +20,40 @@ MISSING = Missing()
 
 
 class ValidationError(Exception):
-    pass
+
+    def __init__(self, message='', errors=None):
+        self.errors = errors
+        super().__init__(message)
 
 
 class Field:
 
-    def __init__(self, distaff, schema):
+    def __init__(self, distaff, schema, errors):
         self.distaff = distaff
         self.schema = schema
+        self.errors = errors
 
     def isna(self, value):
-        return value is None
+        return value is None or value is MISSING
 
     def native(self, value):
-        if isinstance(value, self.type):
+        if isinstance(value, self.native_type):
             return value
         else:
-            raise ValidationError("can't convert %r into %r" % (type(value), self.type))
+            raise ValidationError("can't convert %r into %r" % (type(value), self.native_type))
 
     def traverse(self, value, path, kwargs):
         return value
 
     def validate(self, value):
         if self.isna(value):
-            if self.schema.get('required', False):
+            if self.schema['required']:
                 raise ValidationError('a value is required')
             else:
                 return
 
-        if not isinstance(value, self.type):
-            raise ValidationError('got %r, but expected type was %r' % (type(value), self.type))
+        if not isinstance(value, self.native_type):
+            raise ValidationError('got %r, but expected type was %r' % (type(value), self.native_type))
 
         if self.schema['choices'] and value not in self.schema['choices']:
             raise ValidationError('%r is not one of %r' % (value, self.schema['choices']))
@@ -50,21 +63,11 @@ class Field:
 
 
 class Boolean(Field):
-    type = bool
+    native_type = bool
 
-    sschema = {
-        'false': {
-            'type': 'list',
-            'items': [{'type': 'string'}],
-            'default': ['false', '0', 'no', 'off'],
-            'required': True,
-        },
-        'true': {
-            'type': 'list',
-            'items': [{'type': 'string'}],
-            'default': ['true', '1', 'yes', 'on'],
-            'required': True,
-        },
+    _schema = {
+        'false': dtype('list', required=True, items=dtype('string'), default=['false', 'off', 'no', '0']),
+        'true': dtype('list', required=True, items=dtype('string'), default=['true', 'on', 'yes', '1']),
     }
 
     false = ['false', '0', 'no', 'off']
@@ -77,15 +80,15 @@ class Boolean(Field):
             elif value in self.true:
                 return True
             else:
-                raise ValidationError("can't convert %r into %r" % (value, self.type))
+                raise ValidationError("can't convert %r into %r" % (value, self.native_type))
 
         return super().native(value)
 
 
 class Integer(Field):
-    type = int
+    native_type = int
 
-    sschema = {
+    _schema = {
     }
 
     def native(self, value):
@@ -96,10 +99,10 @@ class Integer(Field):
 
 
 class String(Field):
-    type = str
+    native_type = str
 
-    sschema = {
-        'empty': {'type': 'boolean', 'default': True, 'required': True},
+    _schema = {
+        'empty': dtype('boolean', default=True, required=True),
     }
 
     def native(self, value):
@@ -112,11 +115,11 @@ class String(Field):
 
 
 class Date(Field):
-    sschema = {
-        'format': {'type': 'list', 'items': [{'type': 'string'}], 'default': ['%Y-%m-%d']},
+    _schema = {
+        'format': dtype('list', items=dtype('string'), default=['%Y-%m-%d']),
     }
 
-    type = datetime.date
+    native_type = datetime.date
     format = [
         '%Y-%m-%d',
     ]
@@ -136,31 +139,36 @@ class Date(Field):
 
 
 class List(Field):
-    type = list
+    native_type = list
 
-    sschema = {
-        'items': {'type': 'list', 'items': [{'type': 'dict'}], 'required': False},
+    _schema = {
+        'items': dtype('list', items=dtype('dict'), required=False),
     }
 
     def traverse(self, value, path, kwargs):
         result = []
         for key, (schema, val) in enumerate(zip(itertools.cycle(self.schema['items']), value)):
-            result.append(self.distaff.process(schema=schema, data=val, path=path + (key,), **kwargs))
+            logger.debug('    traverse %r', key)
+            result.append(self.process(schema=schema, data=val, path=path + (key,), **kwargs))
         return result
+
+    def process(self, **kwargs):
+        return self.distaff.process(**kwargs)
 
 
 class Dict(Field):
-    type = dict
+    native_type = dict
 
-    sschema = {
-        'items': {'type': 'dict', 'required': False},
+    _schema = {
+        'items': dtype('dict', required=False),
     }
 
     def traverse(self, value, path, kwargs):
         result = {}
         if 'items' in self.schema:
             for key, val in self.schema['items'].items():
-                result[key] = self.distaff.process(
+                logger.debug('    traverse %r', key)
+                result[key] = self.process(
                     schema=val,
                     data=value.get(key, MISSING),
                     path=path + (key,),
@@ -168,18 +176,22 @@ class Dict(Field):
                 )
         else:
             for key, val in value.items():
-                result[key] = self.distaff.process(
-                    schema={'type': 'any'},
+                logger.debug('    traverse %r', key)
+                result[key] = self.process(
+                    schema=dtype('key'),
                     data=val,
                     path=path + (key,),
                     **kwargs,
                 )
         return result
 
+    def process(self, **kwargs):
+        return self.distaff.process(**kwargs)
+
 
 class Any(Field):
 
-    sschema = {
+    _schema = {
     }
 
     def isna(self, value):
@@ -196,18 +208,28 @@ class Any(Field):
                 return
 
 
+class Schema(Dict):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.schema = copy.deepcopy(self.schema)
+
+    def process(self, schema, **kwargs):
+        schema.setdefault('choices', None)
+        schema.setdefault('required', False)
+        return self.distaff.process(schema, **kwargs)
+
+
 class Distaff:
-    sschema = {
-        'type': 'dict',
-        'items': {
-            'type': {'type': 'string', 'required': True},
-            'required': {'type': 'boolean', 'default': False},
-            'default': {'type': 'any'},
-            'choices': {'type': 'list', 'items': [{'type': 'any'}], 'default': None},
-        }
-    }
+    _schema = dtype('schema', required=True, choices=None, items={
+        'type': dtype('string', required=True),
+        'required': dtype('boolean', default=False),
+        'choices': dtype('list', items=dtype('any'), default=None),
+        'default': dtype('any'),
+    })
 
     types = {
+        'schema': Schema,
         'boolean': Boolean,
         'integer': Integer,
         'string': String,
@@ -217,11 +239,11 @@ class Distaff:
         'any': Any,
     }
 
-    def __init__(self, schema, data, **context):
-        self.schema = schema
+    def __init__(self, schema, data=None, **context):
         self.data = data
         self.context = context
-        self.errors = []
+        self.errors = {'errors': [], 'count': 0}
+        self.schema = self.process(self._schema, schema, fail=True, errors=self.errors)
 
     def __call__(self, data):
         self.fillna()
@@ -229,52 +251,56 @@ class Distaff:
         self.check()
 
     def native(self, *, cast=True, validate=True, fail=False, validate_schema=True):
-        return self.process(self.schema, self.data, 'native', cast, validate, fail, validate_schema)
+        return self.process(self.schema, self.data, 'native', cast, validate, fail, errors=self.errors)
 
     def json(self, *, cast=False, validate=False, fail=True, validate_schema=True):
-        return self.process(self.schema, self.data, 'json', cast, validate, fail, validate_schema)
+        return self.process(self.schema, self.data, 'json', cast, validate, fail, errors=self.errors)
 
-    def process(self, schema, data, output, cast, validate, fail, validate_schema=True, path=()):
+    def process(self, schema, data, output='native', cast=True, validate=True, fail=False, path=(), errors=None):
+        logger.debug(
+            'process %r, path=%r, cast=%r, validate=%r, fail=%r',
+            schema['type'], path, cast, validate, fail,
+        )
         DataType = self.types[schema['type']]
-        if validate_schema:
-            sschema = dict(
-                self.sschema,
-                items=dict(
-                    dict(
-                        self.sschema['items'],
-                        type=dict(self.sschema['items']['type'], choices=list(self.types.keys())),
-                    ),
-                    **DataType.sschema,
-                ),
-            )
-            schema = Distaff(sschema, schema).native(validate_schema=False)
-        dtype = DataType(self, schema)
+        logger.debug('  found data type: %r', DataType)
+        dtype = DataType(self, schema, errors)
 
         if 'default' in schema and data is MISSING:
+            logger.debug('  set default value to %r', schema['default'])
             data = schema['default']
 
         if 'fillna' in schema and dtype.isna(data):
+            logger.debug('  fill NA value with %r', schema['fillna'])
             data = schema['fillna']
 
+        isna = dtype.isna(data)
+        logger.debug('  isna=%r', isna)
+
         try:
-            if cast and not dtype.isna(data):
+            if cast and not isna:
+                logger.debug('  convert to native type')
                 data = dtype.native(data)
 
-            if not dtype.isna(data):
+            if validate:
+                logger.debug('  validate')
+                dtype.validate(data)
+
+            if not isna:
+                logger.debug('  traverse')
                 data = dtype.traverse(data, path, {
                     'output': output,
                     'cast': cast,
                     'validate': validate,
-                    'fail': fail,
-                    'validate_schema': validate_schema,
+                    'fail': False,  # let all nested structures complete processing
                 })
 
-            if validate:
-                dtype.validate(data)
         except ValidationError as e:
-            self.errors.append(str(e))
-            if fail:
-                raise
+            logger.debug('  error: %s', e, exc_info=e)
+            dtype.errors['errors'].append(str(e))
+            self.errors['count'] += 1
+
+        if path == () and self.errors['count'] and fail:
+            raise ValidationError(errors=self.errors)
 
         if path:
             return data

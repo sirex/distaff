@@ -1,11 +1,17 @@
-import datetime
-import itertools
+import copy
+import collections
 
 
 class Missing:
 
     def __repr__(self):
         return 'MISSING'
+
+    def __copy__(self):
+        return MISSING
+
+    def __deepcopy__(self, memo):
+        return MISSING
 
 MISSING = Missing()
 
@@ -14,271 +20,254 @@ class ValidationError(Exception):
     pass
 
 
-class Field:
+class Result:
 
-    def __init__(self, distaff, schema):
-        self.distaff = distaff
-        self.schema = schema
+    def __init__(self):
+        self.data = None
+        self.errors = collections.defaultdict(list)
+
+
+class Schema:
+
+    def __init__(self, types, name, params):
+        self.types = types
+        self.dtype =types[name](params)
+
+    def __call__(self, value, cast=True, check=True, fail=False):
+        return self.process(value, cast=cast, check=check, fail=fail)
+
+    def to_native(self, value=MISSING):
+        return self.process(value, cast=True, check=True)
+
+    def process(self, value=MISSING, *, cast=False, check=False, fail=False, result=None, path=()):
+        if result is None:
+            result_is_provided = False
+            result = Result()
+        else:
+            result_is_provided = True
+
+        if value is MISSING:
+            value = self.dtype.params.default
+
+        if self.dtype.isna(value):
+            value = self.dtype.fillna(value)
+
+        na = self.dtype.isna(value)
+
+        try:
+            if cast and not na:
+                value = self.dtype.cast(value)
+
+            if check:
+                self.dtype.check(value)
+
+            if not na:
+                value = self.dtype.traverse(value, path, result=result, cast=cast, check=check)
+        except ValidationError as e:
+            if result_is_provided:
+                result.errors[path].append(str(e))
+            else:
+                raise
+
+        return value
+
+
+class Registry:
+
+    def __init__(self):
+        self.types = {}
+
+    def __call__(self, name, **params):
+        return Schema(self.types, name, params)
+
+    def add_type(self, name, DataType):
+        self.types[name] = DataType
+
+
+Param = collections.namedtuple('Param', ['name', 'types', 'default', 'required', 'disable'])
+
+
+def param(name, types=None, default=MISSING, required=False, disable=False):
+    return Param(name, types, default, required, disable)
+
+
+def get_params(schema, kwargs):
+    schema = {
+        p.name: p
+        for params in reversed(schema)
+        for p in params if not p.disable
+    }
+
+    for key, value in kwargs.items():
+        if key not in schema:
+            raise ValidationError("Unknown parameter %r." % key)
+
+    params = {}
+    for name, param in schema.items():
+        if name in kwargs:
+            value = kwargs[name]
+            if param.types is not None and not isinstance(value, param.types):
+                raise ValidationError("Wrong parameter %r types, expected %r, got %r." % (
+                    name, ' or '.join(str(x) for x in types), type(value),
+                ))
+        elif param.required:
+            raise ValidationError("Parameter %r is required." % name)
+        else:
+            value = copy.deepcopy(param.default)
+        params[name] = value
+
+    names, values = zip(*params.items())
+    return collections.namedtuple('Params', names)(*values)
+
+
+class DataType:
+
+    params = [
+        param('default'),
+        param('fillna'),
+        param('required', bool, default=False),
+        param('null', bool, default=False),
+        param('check', list, default=[]),
+    ]
+
+    messages = {
+        'cast_error': "can't cast {value_type} into {native_type}",
+    }
+
+    def __init__(self, params):
+        schema = [x.params for x in self.__class__.__mro__ if hasattr(x, 'params')]
+        self.params = get_params(schema, params)
+
+    def error(self, name, value=None, **kwargs):
+        raise ValidationError(self.messages[name].format(value=value, params=self.params, **kwargs))
 
     def isna(self, value):
-        return value is None
+        return value is None or value is MISSING
 
-    def native(self, value):
-        if isinstance(value, self.type):
+    def fillna(self, value):
+        if self.params.fillna is not MISSING:
+            value = self.params.fillna
+        return value
+
+    def cast(self, value):
+        if isinstance(value, self.native_type):
             return value
         else:
-            raise ValidationError("can't convert %r into %r" % (type(value), self.type))
+            self.error('cast_error', value_type=type(value), native_type=self.native_type)
 
-    def traverse(self, value, path, kwargs):
-        return value
+    def check(self, value):
+        pass
 
-    def validate(self, value):
-        if self.isna(value):
-            if self.schema.get('required', False):
-                raise ValidationError('a value is required')
-            else:
-                return
-
-        if not isinstance(value, self.type):
-            raise ValidationError('got %r, but expected type was %r' % (type(value), self.type))
-
-        if self.schema['choices'] and value not in self.schema['choices']:
-            raise ValidationError('%r is not one of %r' % (value, self.schema['choices']))
-
-    def json(self, value):
+    def traverse(self, value, path, **kwargs):
         return value
 
 
-class Boolean(Field):
-    type = bool
+@dtype.checker()
+def check_length(dtype, value):
+    if dtype.isna(value):
+        return
 
-    sschema = {
-        'false': {
-            'type': 'list',
-            'items': [{'type': 'string'}],
-            'default': ['false', '0', 'no', 'off'],
-            'required': True,
-        },
-        'true': {
-            'type': 'list',
-            'items': [{'type': 'string'}],
-            'default': ['true', '1', 'yes', 'on'],
-            'required': True,
-        },
+    if dtype.params.gt is not None and dtype.params.gt <= len(value):
+        self.error('gt', length=len(value))
+
+
+class Str(DataType):
+    native_type = str
+
+    params = [
+        param('null', bool, default=False),
+        param('gt', int, default=0),
+        param('gte', int, default=None),
+        param('lt', int, default=None),
+        param('lte', int, default=None),
+    ]
+
+    checks = [
+        ('length', check_length),
+    ]
+
+    messages = {
+        'gt': "string should be longer than {params.gt}, got {length}",
     }
 
-    false = ['false', '0', 'no', 'off']
-    true = ['true', '1', 'yes', 'on']
-
-    def native(self, value):
-        if isinstance(value, str):
-            if value in self.false:
-                return False
-            elif value in self.true:
-                return True
-            else:
-                raise ValidationError("can't convert %r into %r" % (value, self.type))
-
-        return super().native(value)
+    def cast(self, value):
+        return str(value)
 
 
-class Integer(Field):
-    type = int
+@dtype.checker()
+def check_range(dtype, value):
+    if dtype.isna(value):
+        return
 
-    sschema = {
+    if dtype.params.gt is not None and dtype.params.gt <= value:
+        dtype.error('gt', value)
+
+
+class Int(DataType):
+    native_type = int
+
+    params = [
+        param('null', bool, default=False),
+        param('gt', int, default=0),
+        param('gte', int, default=None),
+        param('lt', int, default=None),
+        param('lte', int, default=None),
+    ]
+
+    checks = [
+        ('range', check_range),
+    ]
+
+    messages = {
+        'gt': "number should be greater than {params.gt}, got {value!r}",
     }
 
-    def native(self, value):
+    def cast(self, value):
         if isinstance(value, str):
             return int(value)
         else:
-            return super().native(value)
+            return super().cast(value)
 
 
-class String(Field):
-    type = str
+class Dict(DataType):
+    native_type = dict
 
-    sschema = {
-        'empty': {'type': 'boolean', 'default': True, 'required': True},
-    }
-
-    def native(self, value):
-        if isinstance(value, int):
-            return str(value)
-        elif isinstance(value, bool):
-            return 'true' if value else 'false'
-        else:
-            return super().native(value)
-
-
-class Date(Field):
-    sschema = {
-        'format': {'type': 'list', 'items': [{'type': 'string'}], 'default': ['%Y-%m-%d']},
-    }
-
-    type = datetime.date
-    format = [
-        '%Y-%m-%d',
+    params = [
+        param('default', dict, default={}),
+        param('keys', Schema),
+        param('values', Schema),
+        param('items', dict, default={}),
     ]
 
-    def native(self, value):
-        if isinstance(value, str):
-            for format in self.schema.get('format', self.format):
-                try:
-                    return datetime.datetime.strptime(value, format).date()
-                except ValueError:
-                    pass
-
-        return super().native(value)
-
-    def json(self, value):
-        return value.strftime(self.format[0])
+    def traverse(self, value, path, **kwargs):
+        result = {k: v for k, v in value.items()}
+        if self.params.items:
+            for key, val in self.params.items.items():
+                v = val.process(value.get(key, MISSING), path=path + (key,), **kwargs)
+                if v is not MISSING:
+                    result[key] = v
+        return result
 
 
-class List(Field):
-    type = list
+class List(DataType):
+    native_type = list
 
-    sschema = {
-        'items': {'type': 'list', 'items': [{'type': 'dict'}], 'required': False},
-    }
+    params = [
+        param('default', list),
+        param('items', Schema, default=None),
+    ]
 
-    def traverse(self, value, path, kwargs):
+    def traverse(self, value, path, **kwargs):
+        if self.params.items is None:
+            return [x for x in value]
+
         result = []
-        for key, (schema, val) in enumerate(zip(itertools.cycle(self.schema['items']), value)):
-            result.append(self.distaff.process(schema=schema, data=val, path=path + (key,), **kwargs))
+        for key, val in enumerate(value):
+            result.append(self.params.items.process(val, path=path + (key,), **kwargs))
         return result
 
 
-class Dict(Field):
-    type = dict
-
-    sschema = {
-        'items': {'type': 'dict', 'required': False},
-    }
-
-    def traverse(self, value, path, kwargs):
-        result = {}
-        if 'items' in self.schema:
-            for key, val in self.schema['items'].items():
-                result[key] = self.distaff.process(
-                    schema=val,
-                    data=value.get(key, MISSING),
-                    path=path + (key,),
-                    **kwargs,
-                )
-        else:
-            for key, val in value.items():
-                result[key] = self.distaff.process(
-                    schema={'type': 'any'},
-                    data=val,
-                    path=path + (key,),
-                    **kwargs,
-                )
-        return result
-
-
-class Any(Field):
-
-    sschema = {
-    }
-
-    def isna(self, value):
-        return value is MISSING
-
-    def native(self, value):
-        return value
-
-    def validate(self, value):
-        if self.isna(value):
-            if self.schema.get('required', False):
-                raise ValidationError('a value is required')
-            else:
-                return
-
-
-class Distaff:
-    sschema = {
-        'type': 'dict',
-        'items': {
-            'type': {'type': 'string', 'required': True},
-            'required': {'type': 'boolean', 'default': False},
-            'default': {'type': 'any'},
-            'choices': {'type': 'list', 'items': [{'type': 'any'}], 'default': None},
-        }
-    }
-
-    types = {
-        'boolean': Boolean,
-        'integer': Integer,
-        'string': String,
-        'date': Date,
-        'list': List,
-        'dict': Dict,
-        'any': Any,
-    }
-
-    def __init__(self, schema, data, **context):
-        self.schema = schema
-        self.data = data
-        self.context = context
-        self.errors = []
-
-    def __call__(self, data):
-        self.fillna()
-        self.cast()
-        self.check()
-
-    def native(self, *, cast=True, validate=True, fail=False, validate_schema=True):
-        return self.process(self.schema, self.data, 'native', cast, validate, fail, validate_schema)
-
-    def json(self, *, cast=False, validate=False, fail=True, validate_schema=True):
-        return self.process(self.schema, self.data, 'json', cast, validate, fail, validate_schema)
-
-    def process(self, schema, data, output, cast, validate, fail, validate_schema=True, path=()):
-        DataType = self.types[schema['type']]
-        if validate_schema:
-            sschema = dict(
-                self.sschema,
-                items=dict(
-                    dict(
-                        self.sschema['items'],
-                        type=dict(self.sschema['items']['type'], choices=list(self.types.keys())),
-                    ),
-                    **DataType.sschema,
-                ),
-            )
-            schema = Distaff(sschema, schema).native(validate_schema=False)
-        dtype = DataType(self, schema)
-
-        if 'default' in schema and data is MISSING:
-            data = schema['default']
-
-        if 'fillna' in schema and dtype.isna(data):
-            data = schema['fillna']
-
-        try:
-            if cast and not dtype.isna(data):
-                data = dtype.native(data)
-
-            if not dtype.isna(data):
-                data = dtype.traverse(data, path, {
-                    'output': output,
-                    'cast': cast,
-                    'validate': validate,
-                    'fail': fail,
-                    'validate_schema': validate_schema,
-                })
-
-            if validate:
-                dtype.validate(data)
-        except ValidationError as e:
-            self.errors.append(str(e))
-            if fail:
-                raise
-
-        if path:
-            return data
-        elif output == 'native':
-            return data
-        elif output == 'json':
-            return dtype.json(data)
+dtype = Registry()
+dtype.add_type('int', Int)
+dtype.add_type('dict', Dict)
+dtype.add_type('list', List)

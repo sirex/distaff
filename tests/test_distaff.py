@@ -1,52 +1,197 @@
 import pytest
-import datetime
 
-from distaff import Distaff, ValidationError, MISSING
+from databot.dtypes import dtype, ValidationError
 
-
-def test_date():
-    schema = {'type': 'date'}
-
-    distaff = Distaff(schema, '2016-01-01')
-    assert distaff.native() == datetime.date(2016, 1, 1)
-
-    distaff = Distaff(schema, datetime.date(2016, 1, 1))
-    assert distaff.json() == '2016-01-01'
 
 
 def test_default():
-    schema = {'type': 'date', 'default': None}
-    distaff = Distaff(schema, MISSING)
-    assert distaff.native() is None
-
-    schema = {'type': 'boolean', 'default': False}
-    distaff = Distaff(schema, None)
-    assert distaff.native() is None
+    schema = dtype('int', default=42)
+    assert schema().data == 42
 
 
-def test_required():
-    schema = {'type': 'boolean', 'required': True}
-    distaff = Distaff(schema, None)
-    with pytest.raises(ValidationError):
-        distaff.native(fail=True)
-    assert distaff.errors == ['a value is required']
+def test_int_str_to_int():
+    assert dtype('1', 'int').data == 1
 
 
-def test_choices():
-    schema = {'type': 'string', 'choices': ['a', 'b']}
-    distaff = Distaff(schema, 'c')
-    with pytest.raises(ValidationError):
-        distaff.native(fail=True)
-    assert distaff.errors == ['a value is required']
+def test_int_gt():
+    assert dtype(2, 'int', gt=1) == 2
+    assert dtype(2, 'int', gt=2).errors == ["Value should be greater than 2, got 2."]
+    assert dtype(2, 'int', gt=3).errors == ["Value should be greater than 3, got 2."]
 
 
 def test_dict():
-    schema = {'type': 'dict', 'items': {'type': {'type': 'string'}}}
-    distaff = Distaff(schema, {'type': 'boolean'})
-    assert distaff.native() == {'type': 'boolean'}
+    schema = dtype('dict', items={
+        'a': dtype('int'),
+        'b': dtype('dict'),
+    })
+
+    data = {
+        'a': '42',
+        'b': {'foo': 'bar'},
+    }
+
+    assert schema(data).data == {
+        'a': 42,
+        'b': {'foo': 'bar'},
+    }
 
 
 def test_list():
-    schema = {'type': 'list', 'items': [{'type': 'integer'}]}
-    distaff = Distaff(schema, [1, '2', '3'])
-    assert distaff.native() == [1, 2, 3]
+    data = ['1', '2', '3', 4]
+    assert dtype(data, 'list').data == data
+
+    schema = dtype('list', items=dtype('int'))
+    assert schema(data).data == [1, 2, 3, 4]
+
+
+def test_nested():
+    schema = dtype('dict', items={
+        'a': dtype('int'),
+        'b': dtype('list'),
+        'c': dtype('dict', items={
+            'c.a': dtype('dict', items={
+                'c.a.a': dtype('int', default=3),
+            }),
+        }),
+    })
+
+    assert schema({}).data == {
+        'c': {
+            'c.a': {
+                'c.a.a': 3,
+            },
+        },
+    }
+
+
+def test_password_check():
+    @dtype.checker(level=-1, messages={
+        'mismatch': "Passwords don't match.",
+    })
+    def passwords_match(dtype, value):
+        if value['pasword'] != value['passwords_match']:
+            dtype.error('mismatch')
+
+    schema = dtype('dict', items={
+        'username': dtype('str', gt=3),
+        'pasword': dtype('str'),
+        'pasword_confirm': dtype('str', checks=[passwords_match]),
+    })
+
+    assert schema({}).data == {}
+
+
+def test_converter():
+    @dtype.converter('int', str)
+    def verbose_numbers(dtype, value):
+        if value == 'one':
+            return 1
+
+    assert dtype('one', 'int').data == 1
+    assert dtype('uno', 'int').errors == ["Don't know how to convert 'uno' to 'int'."]
+
+
+def test_first_arg_value():
+    assert dtype('int')('-').errors == ["Don't know how to convert '-' to 'int'."]
+    assert dtype('-', 'int').errors == ["Don't know how to convert '-' to 'int'."]
+
+
+def test_nested_errors():
+    schema = dtype('dict', items={
+        'a': dtype('int'),
+        'b': dtype('int'),
+        'x': dtype('list', gt=5, items=dtype('int')),
+    })
+
+    data = {
+        'a': '-',
+        'b': '-',
+        'c': 1,
+        'x': [1, 2, 'err'],
+    }
+
+    assert schema(data).errors == {
+        'errors': ["Unknown item 'c'."],
+        'items': {
+            'a': ["Don't know how to convert '-' to 'int'."],
+            'b': ["Don't know how to convert '-' to 'int'."],
+            'x': {
+                'errors': ["Expected more than 5 items in the list, got 3."],
+                'items': {
+                    2: ["Don't know how to convert 'err' to 'int'."],
+                }
+            }
+        }
+    }
+
+
+def test_context():
+    db = [3, 4, 8]
+
+    @dtype.checker(
+        context=[
+            param('db', list, required=True),
+        ],
+        messages={
+            'duplicate': "Value {value!r} already exist in the database.",
+        },
+    )
+    def duplicate(dtype, value):
+        if value in dtype.context.db:
+            dtype.error('duplicate', value)
+
+    schema = dtype('int', checks=[duplicate])
+    with schema.context(db=db):
+        assert schema(1).data == 1
+        assert schema(3).errors == ["Value 3 already exist in the database."]
+
+    context = {'db': db}
+    assert schema(1, context=context).data == 1
+    assert schema(3, context=context).errors == ["Value 3 already exist in the database."]
+
+
+def test_results():
+    schema = dtype('int')
+    result = schema('42')
+    assert result.data == 42
+    assert result.errors == []
+    assert result.json() == '42'
+    assert result.json(serialize=False) == 42
+
+
+def test_results_error():
+    schema = dtype('int')
+    result = schema('err')
+    assert result.data is None
+    assert result.errors == ["Don't know how to convert 'err' to 'int'."]
+    assert result.json() == 'null'
+    assert result.json(serialize=False) == None
+
+
+def test_serializer():
+
+    @dtype.serializer('json')
+    def json(value, serialize):
+        if serialize:
+            return json.dumps(value)
+        else:
+            return value
+
+    @dtype.serializer('json', 'date')
+    def json_date(value):
+        return value.isoformat()
+
+    schema = dtype('dict', items={
+        'date': dtype('date'),
+        'ints': dtype('list', items=dtype('int')),
+    })
+
+    data = {
+        'date': datetime.date(2000, 1, 1),
+        'ints': [1, '2', 3],
+    }
+
+    assert schema(data).json(serialize=False) == {
+        'date': '2000-01-01',
+        'ints': [1, 2, 3],
+    }

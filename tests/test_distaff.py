@@ -1,3 +1,4 @@
+import pytz
 import pytest
 
 from databot.dtypes import dtype, ValidationError
@@ -14,9 +15,29 @@ def test_int_str_to_int():
 
 
 def test_int_gt():
-    assert dtype(2, 'int', gt=1) == 2
+    assert dtype(2, 'int', gt=1).data == 2
     assert dtype(2, 'int', gt=2).errors == ["Value should be greater than 2, got 2."]
     assert dtype(2, 'int', gt=3).errors == ["Value should be greater than 3, got 2."]
+
+
+def test_datetime():
+    schema = dtype('datetime')
+    data = '2017-02-18T11:11:02.754778+00:00'
+    assert schema(data).data == datetime.datetime(2017, 2, 18, 11, 11, 2, 754778, tzinfo=pytz.utc)
+
+
+def test_oneof():
+    data = [1, '2']
+
+    schema = dtype('list', items=dtype('oneof', choices=[
+        dtypes('str'),
+        dtypes('int'),
+    ]))
+    assert schema(data).data == [1, '2']
+
+    # Same as above, but using or operator.
+    schema = dtype('list', items=dtypes('str') | dtypes('int'))
+    assert schema(data).data == [1, '2']
 
 
 def test_dict():

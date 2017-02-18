@@ -1,7 +1,7 @@
 import pytz
 import pytest
 
-from databot.dtypes import dtype, ValidationError
+from databot.dtypes import dtype, ValidationError, Form
 
 
 
@@ -96,7 +96,7 @@ def test_password_check():
     schema = dtype('dict', items={
         'username': dtype('str', gt=3),
         'pasword': dtype('str'),
-        'pasword_confirm': dtype('str', checks=[passwords_match]),
+        'pasword_confirm': dtype('str', check=[passwords_match]),
     })
 
     assert schema({}).data == {}
@@ -161,7 +161,7 @@ def test_context():
         if value in dtype.context.db:
             dtype.error('duplicate', value)
 
-    schema = dtype('int', checks=[duplicate])
+    schema = dtype('int', check=[duplicate])
     with schema.context(db=db):
         assert schema(1).data == 1
         assert schema(3).errors == ["Value 3 already exist in the database."]
@@ -216,3 +216,53 @@ def test_serializer():
         'date': '2000-01-01',
         'ints': [1, 2, 3],
     }
+
+
+def test_parametrized_checker():
+    db = {
+        'users': [
+            'user1',
+            'user3',
+        ]
+    }
+
+    def unique(table):
+        @dtype.checker(
+            context=[
+                param('db', dict, required=True),
+            ],
+            messages={
+                'duplicate': "Value {value!r} already exist in the database.",
+            },
+        )
+        def check(dtype, value):
+            if value in dtype.context.db[table]:
+                dtype.error('duplicate', value)
+
+    schema = {
+        'username': dtype('str', check=[unique('users')]),
+        'password': dtype('str'),
+    }
+
+    data = {
+        'username': 'user3',
+        'password': '',
+    }
+
+    assert schema(data).errors == {
+        'errors': [],
+        'items': {
+            'username': ["Value 'user3' already exist in the database."],
+        }
+    }
+
+
+def test_infer_dict_type():
+    document = {'name': 'john doe'}
+
+    schema = dtype({'name': {'type': 'str'}})
+    assert schema(document).errors == []
+
+    # Same as above, but using dtype helper.
+    schema = dtype({'name': dtype('str')})
+    assert schema(document).errors == []

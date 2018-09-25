@@ -1,57 +1,46 @@
+import datetime
+
 import pytz
-import pytest
 
-from databot.dtypes import dtype, ValidationError, Form
-
+from distaff import this
 
 
 def test_default():
-    schema = dtype('int', default=42)
-    assert schema().data == 42
+    assert this.default(42).execute().result == 42
 
 
 def test_int_str_to_int():
-    assert dtype('1', 'int').data == 1
+    assert this.cast(int).execute('1').result == 1
 
 
 def test_int_gt():
-    assert dtype(2, 'int', gt=1).data == 2
-    assert dtype(2, 'int', gt=2).errors == ["Value should be greater than 2, got 2."]
-    assert dtype(2, 'int', gt=3).errors == ["Value should be greater than 3, got 2."]
+    assert (this.check(int) > 1).execute(2).result == 2
+    assert (this.check(int) > 1).execute(2).errors == []
+    assert (this.check(int) > 3).execute(2).result == 2
+    assert (this.check(int) > 3).execute(2).errors == ["Value should be greater than 3, got 2."]
 
 
 def test_datetime():
-    schema = dtype('datetime')
     data = '2017-02-18T11:11:02.754778+00:00'
-    assert schema(data).data == datetime.datetime(2017, 2, 18, 11, 11, 2, 754778, tzinfo=pytz.utc)
+    assert this.datetime().execute(data) == datetime.datetime(2017, 2, 18, 11, 11, 2, 754778, tzinfo=pytz.utc)
 
 
 def test_oneof():
-    data = [1, '2']
-
-    schema = dtype('list', items=dtype('oneof', choices=[
-        dtypes('str'),
-        dtypes('int'),
-    ]))
-    assert schema(data).data == [1, '2']
-
-    # Same as above, but using or operator.
-    schema = dtype('list', items=dtypes('str') | dtypes('int'))
-    assert schema(data).data == [1, '2']
+    assert this.check(list).each(this.oneof(
+        this.check(str),
+        this.check(int),
+    )).execute([1, '2']).result == [1, '2']
 
 
 def test_dict():
-    schema = dtype('dict', items={
-        'a': dtype('int'),
-        'b': dtype('dict'),
-    })
-
     data = {
         'a': '42',
         'b': {'foo': 'bar'},
     }
-
-    assert schema(data).data == {
+    assert this.check(dict).create({
+        'a': this.a,
+        'b': this.b.check(dict),
+    }).execute(data).result == {
         'a': 42,
         'b': {'foo': 'bar'},
     }
@@ -59,24 +48,20 @@ def test_dict():
 
 def test_list():
     data = ['1', '2', '3', 4]
-    assert dtype(data, 'list').data == data
-
-    schema = dtype('list', items=dtype('int'))
-    assert schema(data).data == [1, 2, 3, 4]
+    assert this.execute(data).result == data
+    assert this.each(this.cast(int)).execute(data) == [1, 2, 3, 4]
 
 
 def test_nested():
-    schema = dtype('dict', items={
-        'a': dtype('int'),
-        'b': dtype('list'),
-        'c': dtype('dict', items={
-            'c.a': dtype('dict', items={
-                'c.a.a': dtype('int', default=3),
-            }),
-        }),
-    })
-
-    assert schema({}).data == {
+    assert this.check(dict).create({
+        'a': this.a.check(int),
+        'b': this.b.check(list),
+        'c': this.c.check(dict).create({
+            'c.a': this['c.a'].check(dict).create({
+                'c.a.a': this['c.a.a'].default(3).check(int)
+            })
+        })
+    }).execute({}).result == {
         'c': {
             'c.a': {
                 'c.a.a': 3,
